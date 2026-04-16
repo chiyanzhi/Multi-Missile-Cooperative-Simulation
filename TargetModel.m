@@ -1,115 +1,79 @@
-function [nextState, logData] = TargetModel(currentState, threatState, dt, params)
-    % TargetModel 目标智能体 (含博弈逻辑)
-    % 输入:
-    %   currentState: 目标当前状态 (pos, vel, time, maneuverType...)
-    %   threatState:  最具威胁的导弹状态 (pos, vel) - 相当于RWR数据
-    %   params:       TargetParams 返回的结构体
-    
-    % 提取状态
+function [nextState, logData] = TargetModel(currentState, escapeAccCmd, dt, params, environment)
+    % --- 初始化 ---
     pos = currentState.pos;
     vel = currentState.vel;
-    time = currentState.time;
-    
-    % 1. 态势感知 (Situation Awareness)
-    % 计算与威胁源的相对关系
-    R_vec = threatState.pos - pos;
-    dist = norm(R_vec);
-    
-    % 默认加速度
-    accCmd = [0, 0, 0];
-    currentMode = 'CRUISE';
-    
-    % 2. 博弈决策逻辑 (Game Logic)
-    
-    if dist > params.RWR_range
-        % --- 阶段 A: 巡航 ---
-        currentMode = 'PATROL';
-        accCmd = [0, 0, 0]; 
-        
-    elseif dist > params.Panic_range
-        % --- 阶段 B: 战术规避 ---
-        currentMode = 'TACTICAL';
-        
-        % 策略：做蛇形机动消耗导弹能量 (Energy Bleeding)
-        % 垂直于导弹来袭方向做正弦运动
-        threatDir = R_vec / dist;
-        velDir = vel / norm(vel);
-        
-        % 计算侧向向量 (水平面的左/右)
-        sideDir = cross(threatDir, [0,0,1]); 
-        if norm(sideDir) < 0.1, sideDir = [1,0,0]; end
-        sideDir = sideDir / norm(sideDir);
-        
-        % 5G 的蛇形机动
-        g_force = 5 * 9.81 * sin(0.5 * time); 
-        accCmd = sideDir * g_force;
-        
+    if isfield(currentState, 'acc')
+        acc_prev = currentState.acc;
     else
-        % --- 阶段 C: 终极规避 ---
-        % 引入随机性
-        
-        % 利用 time 简单模拟随机切换 (每5秒换一招)
-        seed = floor(time / params.maneuverChangeInterval);
-        strategy = mod(seed, 3); % 0, 1, 2 三种随机策略
-        
-        threatDir = R_vec / dist;
-        v_mag = norm(vel);
-        v_dir = vel / v_mag;
-        
-        switch strategy
-            case 0 % 策略: 3-9线机动 
-                % 试图与导弹成90度夹角，利用多普勒盲区，同时最大化导弹过载
-                currentMode = '3-9线机动';
-                
-                % 目标航向：垂直于导弹连线
-                desiredDir = cross(threatDir, [0,0,1]); 
-                desiredDir = desiredDir / norm(desiredDir);
-                errorDir = desiredDir - v_dir;
-                accCmd = errorDir * params.maxG_evade * 9.81;
-                
-            case 1 % 策略: 桶滚/螺旋下坠
-                currentMode = '桶滚/螺旋下坠';                
-                accCmd = [0, 0, -params.maxG_evade * 9.81];
-                
-            case 2 % 策略: 迎头对冲 
-                currentMode = '迎头对冲';
-                accCmd = (threatDir - v_dir) * 3 * 9.81;
-        end
+        acc_prev = [0, 0, 0];
     end
-    
-   
-    % 限制最大过载
+
+    g = environment.g;
+    speed = norm(vel);
+    % 速度方向单位向量（保护除零）
+    if speed > 1e-3
+        vel_unit = vel / speed;
+    else
+        vel_unit = [1, 0, 0]; % 速度为0时默认方向
+    end
+
+    % --- 1. 策略指令输入（外部传入，不再内部计算） ---
+    accCmd = escapeAccCmd;
+
+    % --- 2. 物理动力学限制 ---
+    % A. 指令限幅（区分巡航/逃逸过载）
     accMag = norm(accCmd);
-    maxAcc = params.maxG_evade * 9.81;
+    maxAcc = params.maxG_evade * g; % 固定用逃逸过载（9G）
     if accMag > maxAcc
         accCmd = accCmd / accMag * maxAcc;
     end
+
+    % B. 一阶惯性环节（飞控延迟）
+    real_acc = acc_prev + (accCmd - acc_prev) * (dt / params.tau);
+
+    % C. 能量守恒与诱导阻力（引入环境模型）
+    current_G = norm(real_acc) / g;
+    thrust_g = params.thrust_max; 
+    if speed > params.maxSpeed, thrust_g = 0; end 
     
-    % 动力学积分
-    nextVel = vel + accCmd * dt;
+    % --- [修改开始] 引入大气密度影响 ---
+    % 获取当前高度的大气密度
+    rho = environment.getDensity(pos(3));
+    rho0 = 1.225; % 海平面标准密度
+    density_ratio = rho / rho0;
     
-    % 速度限制 
-    spd = norm(nextVel);
-    if spd > params.maxSpeed
-        nextVel = nextVel / spd * params.maxSpeed;
-    elseif spd < params.minSpeed
-        nextVel = nextVel / spd * params.minSpeed;
+    % 阻力计算优化：
+    % 原公式隐含假设海平面密度。现在乘以密度比，模拟高空阻力减小。
+    % 阻力 F_drag = 0.5 * rho * v^2 * Cd * S
+    % 这里 drag_g 是过载形式，正比于 rho * v^2
+    base_drag = (0.05 + params.dragFactor * current_G^2);
+    
+    % 动压项：(speed/340)^2 代表马赫数平方项，需修正密度影响
+    drag_g = base_drag * (speed/340)^2 * density_ratio; 
+ 
+    vel_dir = vel / (speed + 1e-6);
+    acc_tangential = (thrust_g * g - drag_g * g) * vel_dir;
+
+    % 总加速度
+    final_acc = real_acc + acc_tangential - [0,0,g]; 
+
+    % --- 3. 积分更新 ---
+    nextVel = vel + final_acc * dt;
+    % 强制最小速度限制（防止失速）
+    nextSpeed = norm(nextVel);
+    if nextSpeed < params.minSpeed
+        nextVel = nextVel / nextSpeed * params.minSpeed;
     end
-    
     nextPos = pos + nextVel * dt;
-    
-    % 防止钻地
-    if nextPos(3) < 50
-        nextPos(3) = 50; 
-        nextVel(3) = 0; 
-    end
-    
-    % 5. 输出状态
+    if nextPos(3) < 10, nextPos(3) = 10; nextVel(3) = 0; end % 最低高度限制
+
+    % --- 4. 输出 ---
     nextState.pos = nextPos;
     nextState.vel = nextVel;
-    nextState.time = time + dt;
-    nextState.mode = currentMode; % 记录当前在干嘛
-    
-    logData.acc = accCmd;
-    logData.mode = currentMode;
+    nextState.acc = real_acc;
+    nextState.time = currentState.time + dt;
+
+    logData.acc = real_acc;
+    %logData.mode = currentMode;
+    logData.speed = norm(nextVel);
 end
